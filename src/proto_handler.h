@@ -42,6 +42,7 @@ int proto_decode_fromradio(const uint8_t *buf, uint16_t len,
  *   - want_config_id : the phone is requesting the config burst; the proxy
  *                      serves this locally from the cache (never forwards to
  *                      UART). The nonce is echoed back in config_complete_id.
+ *   - disconnect     : the phone has disconnected; absorbed locally.
  *   - heartbeat      : serial-link keepalive; absorbed locally (reactive
  *                      queueStatus reply), never forwarded to UART.
  *
@@ -51,7 +52,8 @@ int proto_decode_fromradio(const uint8_t *buf, uint16_t len,
 struct toradio_info {
     bool      has_want_config;  /* which_payload_variant == want_config_id_tag */
     uint32_t  want_config_id;   /* the phone's config nonce — valid iff above  */
-    bool      has_heartbeat;    /* which_payload_variant == heartbeat_tag      */
+    bool      has_disconnect;   /* which_payload_variant == disconnect_tag (4) */
+    bool      has_heartbeat;    /* which_payload_variant == heartbeat_tag  (7) */
 
     /* Decoded MeshPacket payload (phone -> radio real packet). Valid only when
      * is_packet == true; payload_bytes points into proto_handler's internal

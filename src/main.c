@@ -89,6 +89,13 @@ static void on_toradio_ble(struct bt_conn *conn, const uint8_t *data, uint16_t l
         ble_gatt_reply_queuestatus(conn);
         return;
     }
+
+    if (ti.has_disconnect) {
+        /* Absorbed locally: never forward through UART to keep the drain of toPhoneQueue*/
+        LOG_INF("ToRadio disconnect from conn %p — absorbed (not forwarded)", (void *)conn);
+        return;
+    }
+
 #if IS_ENABLED(CONFIG_MESHTASTIC_ROUTE_TRACE)
     /* TESTING ONLY: Assumes proxy-framed payload with 4-byte IDs. */
     if (ti.is_packet && ti.portnum == PROXY_PORTNUM && ti.payload_len >= PROXY_HEADER_SIZE) {

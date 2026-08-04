@@ -108,12 +108,16 @@ int proto_decode_toradio(const uint8_t *buf, uint16_t len,
         out->want_config_id  = s_toradio.want_config_id;
         LOG_DBG("ToRadio want_config_id=%u", out->want_config_id);
         break;
+    case meshtastic_ToRadio_disconnect_tag:
+        out->has_disconnect = true;
+        LOG_DBG("ToRadio disconnect");
+        break;
     case meshtastic_ToRadio_heartbeat_tag:
         out->has_heartbeat = true;
         LOG_DBG("ToRadio heartbeat");
         break;
     default:
-        /* packet / disconnect / xmodem / mqtt / empty — caller forwards. */
+        /* packet / xmodem / mqtt / empty — caller forwards. */
         if (s_toradio.which_payload_variant == meshtastic_ToRadio_packet_tag &&
             s_toradio.packet.which_payload_variant ==
                 meshtastic_MeshPacket_decoded_tag) {
@@ -125,8 +129,15 @@ int proto_decode_toradio(const uint8_t *buf, uint16_t len,
             out->payload_bytes = s_toradio.packet.decoded.payload.bytes;
             out->payload_len   = (uint16_t)s_toradio.packet.decoded.payload.size;
         }
-        LOG_DBG("ToRadio variant=%d (passthrough)",
+
+        if (out->is_packet) {
+            LOG_DBG("ToRadio variant=%d, portnum=%d (passthrough)",
+                s_toradio.which_payload_variant,
+                s_toradio.packet.decoded.portnum);
+        } else {
+            LOG_DBG("ToRadio variant=%d (passthrough)",
                 s_toradio.which_payload_variant);
+        }
         break;
     }
 
