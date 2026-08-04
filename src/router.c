@@ -114,7 +114,7 @@ void router_dispatch(const uint8_t *raw_bytes, uint16_t len,
              * phone connects and calls NODE_REG, subsequent messages are targeted.
              */
             LOG_DBG("proxy: dst=+56%" PRIu32 " not registered -> broadcast fallback",
-                    sys_get_le32(hdr.dst.bytes));
+                    sys_get_be32(hdr.dst.bytes));
             ble_gatt_broadcast_fromradio(raw_bytes, len);
         }
         return;
