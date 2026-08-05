@@ -71,7 +71,12 @@ static void on_toradio_ble(struct bt_conn *conn, const uint8_t *data, uint16_t l
     if (ti.has_want_config) {
         /* Serve config locally: replay if the cache is ready, else PENDING. */
         enum upstream_state st = upstream_get_state();
-        if (st == UPSTREAM_CACHE_READY || st == UPSTREAM_LIVE) {
+
+        if(st != UPSTREAM_LIVE && st != UPSTREAM_CACHE_READY) {
+            return;
+        }
+
+        if (st == UPSTREAM_CACHE_READY || st == UPSTREAM_LIVE || st == UPSTREAM_REFETCHING) {
             LOG_INF("want_config nonce=%u from conn %p → replay cached burst",
                     (unsigned)ti.want_config_id, (void *)conn);
             ble_gatt_replay_cached_burst(conn, ti.want_config_id);
@@ -91,7 +96,8 @@ static void on_toradio_ble(struct bt_conn *conn, const uint8_t *data, uint16_t l
     }
 
     if (ti.has_disconnect) {
-        /* Absorbed locally: never forward through UART to keep the drain of toPhoneQueue*/
+        /* Absorbed locally: never forward through UART to keep an active PhoneAPI session.
+         * This keeps the drain of toPhoneQueue*/
         LOG_INF("ToRadio disconnect from conn %p — absorbed (not forwarded)", (void *)conn);
         return;
     }
@@ -107,7 +113,7 @@ static void on_toradio_ble(struct bt_conn *conn, const uint8_t *data, uint16_t l
                     (const char *)&ti.payload_bytes[PROXY_OFF_CONTENT]);
         ROUTE_TRACE_HEXDUMP(ti.payload_bytes, ti.payload_len, "ROUTE UP payload");
     }
-#endif 
+#endif
     /* Real packet → forward to the node, and push the upstream keepalive out
      * the keepalive only fires after a stretch of true silence. */
     int err = uart_meshtastic_tx(data, len);

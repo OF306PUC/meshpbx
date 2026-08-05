@@ -29,6 +29,7 @@ enum upstream_state {
     UPSTREAM_FETCHING,     /* want_config sent; consuming the burst → cache  */
     UPSTREAM_CACHE_READY,  /* burst complete, cache published (transient)    */
     UPSTREAM_LIVE,         /* normal routing; FromRadio no longer cached     */
+    UPSTREAM_REFETCHING,   /* recovery re-fetch; consumes the burst but does NOT touch the cache */
 };
 
 /*
@@ -107,5 +108,14 @@ void upstream_keepalive_reschedule(void);
  * queueStatus is essentially never in flight when the flag is set.
  */
 bool upstream_swallow_live_queuestatus(void);
+
+/*
+ * Recovery re-fetch. Re-issue the proxy's own want_config to reopen the node's
+ * PhoneAPI session (which stops draining toPhoneQueue once it closes), consuming
+ * and DISCARDING the resulting burst so the existing cache stays valid and
+ * servable throughout. No-op if a fetch is already in progress. Called by the
+ * reboot-signal handler and the liveness watchdog.
+ */
+void upstream_refetch(void);
 
 #endif /* UPSTREAM_SESSION_H */

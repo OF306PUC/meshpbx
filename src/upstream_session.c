@@ -282,6 +282,30 @@ static void keepalive_work_handler(struct k_work *work)
 }
 
 /* -------------------------------------------------------------------------
+ * Helper
+ * ------------------------------------------------------------------------- */
+static int send_want_config(uint32_t nonce){
+    meshtastic_ToRadio tr = meshtastic_ToRadio_init_zero;
+    tr.which_payload_variant = meshtastic_ToRadio_want_config_id_tag;
+    tr.want_config_id        = nonce;
+
+    uint8_t buf[meshtastic_ToRadio_size];
+    pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+    if (!pb_encode(&stream, meshtastic_ToRadio_fields, &tr)) {
+        LOG_ERR("want_config pb_encode failed: %s", PB_GET_ERROR(&stream));
+        return -EINVAL;
+    }
+
+    int rc = uart_meshtastic_tx(buf, (uint16_t)stream.bytes_written);
+    if (rc != 0) {
+        LOG_ERR("want_config tx failed: %d", rc);
+        return rc;
+    }
+
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
  * Public API.
  * ------------------------------------------------------------------------- */
 void upstream_session_start(void)
@@ -344,7 +368,7 @@ bool upstream_on_fromradio(const uint8_t *payload, uint16_t len,
                            const struct fromradio_info *info)
 {
     /* LIVE (and BOOT before a fetch) — the session does not consume frames. */
-    if (s_state != UPSTREAM_FETCHING) {
+    if (s_state != UPSTREAM_FETCHING && s_state != UPSTREAM_REFETCHING) {
         return false;
     }
 
@@ -357,7 +381,7 @@ bool upstream_on_fromradio(const uint8_t *payload, uint16_t len,
     /* The closing config_complete_id — finish the burst ONLY if it carries
      * OUR nonce. fromradio_info does not expose config_complete_id, so we
      * decode the nonce here with a minimal local nanopb pass (no change to
-     * proto_handler). The proxy is the node's sole want_config client, 
+     * proto_handler). The proxy is the node's sole want_config client,
      * but we still match strictly so a stray/duplicated
      * config_complete_id can never prematurely close the burst. */
     if (info->which_variant == meshtastic_FromRadio_config_complete_id_tag) {
@@ -384,29 +408,38 @@ bool upstream_on_fromradio(const uint8_t *payload, uint16_t len,
          * cache it — the per-phone replay synthesizes its own config_complete_id
          * carrying THAT phone's nonce (caching this one would replay the boot
          * nonce to phones). We still account it for the Phase 0 byte total. */
-        phase0_account(info->which_variant, len);
         s_p0.config_complete_id = got_nonce;
 
-        cache_mark_ready();
-        log_phase0_breakdown();
+        if (s_state == UPSTREAM_FETCHING) {
+            phase0_account(info->which_variant, len);
+            cache_mark_ready();
+            log_phase0_breakdown();
 
-        s_state = UPSTREAM_CACHE_READY;
-        serve_pending_phones();
-        s_state = UPSTREAM_LIVE;
-        LOG_INF("upstream: config_complete nonce=%u → CACHE_READY → LIVE",
-                (unsigned)got_nonce);
+            s_state = UPSTREAM_CACHE_READY;
+            serve_pending_phones();
+            s_state = UPSTREAM_LIVE;
+            LOG_INF("upstream: config_complete nonce=%u → CACHE_READY → LIVE",
+                    (unsigned)got_nonce);
+        } else if (s_state == UPSTREAM_REFETCHING) {
+            s_state = UPSTREAM_LIVE;
+            LOG_INF("upstream: config complete (absorbed) nonce=%u → LIVE",
+                    (unsigned)got_nonce);
+        }
+
         return true;
     }
 
     /* Any other non-packet variant (my_info, node_info, config, …): cache it. */
-    phase0_account(info->which_variant, len);
-    int rc = cache_add_frame(payload, len, info->which_variant);
-    if (rc != 0) {
-        /* Overflow already logged with byte counts by config_cache. The frame
-         * is dropped (repopulates via live broadcast) but still CONSUMED here:
-         * it must NOT be broadcast during the fetch window. */
-        LOG_WRN("variant=%d dropped from cache (rc=%d)",
-                info->which_variant, rc);
+    if (s_state == UPSTREAM_FETCHING) {
+        phase0_account(info->which_variant, len);
+        int rc = cache_add_frame(payload, len, info->which_variant);
+        if (rc != 0) {
+            /* Overflow already logged with byte counts by config_cache. The frame
+                * is dropped (repopulates via live broadcast) but still CONSUMED here:
+                * it must NOT be broadcast during the fetch window. */
+            LOG_WRN("variant=%d dropped from cache (rc=%d)",
+                    info->which_variant, rc);
+        }
     }
     return true;
 }
@@ -467,4 +500,36 @@ bool upstream_swallow_live_queuestatus(void)
         return true;
     }
     return false;
+}
+
+/* -------------------------------------------------------------------------
+ * Recovery re-fetch: reopen the node's PhoneAPI session without disturbing the
+ * cache. Consumes (and discards) the resulting burst, then returns to LIVE.
+ * Triggers (reboot signal, liveness watchdog) call this. No-op if a fetch is
+ * already in progress, so it can never stomp the boot fetch's nonce.
+ * ------------------------------------------------------------------------- */
+void upstream_refetch(void)
+{
+    enum upstream_state st = s_state;
+    if (st == UPSTREAM_BOOT || st == UPSTREAM_FETCHING ||
+        st == UPSTREAM_REFETCHING) {
+        LOG_DBG("refetch ignored: fetch already in progress (state=%d)", st);
+        return;
+    }
+
+    s_nonce = sys_rand32_get();
+    if (s_nonce == 0 || s_nonce == 1) {
+        s_nonce = 2;
+    }
+
+    int rc = send_want_config(s_nonce);
+    if (rc != 0) {
+        /* Stay LIVE with the existing cache; the retry layer re-attempts. */
+        return;
+    }
+
+    s_state = UPSTREAM_REFETCHING;
+    upstream_keepalive_reschedule();
+    LOG_INF("upstream refetch: want_config nonce=%u sent, REFETCHING",
+            (unsigned)s_nonce);
 }

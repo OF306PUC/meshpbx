@@ -49,13 +49,16 @@ void router_dispatch(const uint8_t *raw_bytes, uint16_t len,
      * Packet variants are NOT consumed (returns false) → fall through so live
      * mesh traffic still reaches the phones during the fetch.
      * ---------------------------------------------------------------- */
-    if (upstream_get_state() == UPSTREAM_FETCHING) {
+    enum upstream_state ust = upstream_get_state();
+    if (ust == UPSTREAM_FETCHING || ust == UPSTREAM_REFETCHING) {
         if (upstream_on_fromradio(raw_bytes, len, info)) {
             return;
         }
         /* else: packet variant — fall through to the normal broadcast path. */
     }
 
+    /* ------------------------ Broadcast Path ------------------------ */
+    
     /* ----------------------------------------------------------------
      * Tier 1: non-packet FromRadio variant → broadcast unconditionally,
      * EXCEPT the queueStatus the node sends in reply to our own upstream

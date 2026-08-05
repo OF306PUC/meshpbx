@@ -100,6 +100,11 @@ limit). `proxy_id` = **4 bytes** = a little-endian `uint32`. (Defined in
 > the UUID string renderers in `src/proxy_protocol.c` are kept for that case.
 > Both ends must agree on `PROXY_ID_SIZE` — it defines the wire layout.
 
+> **Proposed v2:** a 2-byte monotonic `seq` per `(SRC_ID, DST_ID)` pair inserted
+> at offset 9, before the content, so a receiver can compute PDR and loss-burst
+> statistics from its own log alone. Not implemented — see
+> [`seq-numbers-pdr.md`](./seq-numbers-pdr.md).
+
 ### 4.2 The four app changes
 
 **(1) Register on connect — write NODE_REG.**

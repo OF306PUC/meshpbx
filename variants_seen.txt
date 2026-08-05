@@ -1,0 +1,4 @@
+[Payload Variants (FROMRADIO)]
+
+Variant 1  = meshtastic_FromRadio_id_tag 
+Variant 11 = meshtastic_FromRadio_queueStatus_tag  

@@ -127,11 +127,12 @@ def main() -> int:
         "--set", "lora.sx126x_rx_boosted_gain", str(node_params.SX126X_RX_BOOSTED_GAIN).lower(),
     ])
 
-    # Device config: rebroadcast mode and role — set in SEPARATE invocations.
-    # A role change can trigger a reboot, and when both were sent in one command
-    # the rebroadcast_mode write was dropped and never persisted. Set + verify
-    # rebroadcast first, then role.
-    step("device rebroadcast_mode", mesh + [
+    # Device config: role then rebroadcast mode, chained in ONE invocation so
+    # the CLI applies both in a single config write. Role is ordered first;
+    # rebroadcast is verified afterwards, so a dropped write (role reboots) is
+    # still caught by the check below.
+    step("device role + rebroadcast_mode", mesh + [
+        "--set", "device.role", device_role,
         "--set", "device.rebroadcast_mode", node_params.REBROADCAST_MODE,
     ])
     actual = get_config_value(mesh, "device.rebroadcast_mode")
@@ -141,7 +142,6 @@ def main() -> int:
         failures.append("device.rebroadcast_mode (verify)")
     else:
         print(f"Verified device.rebroadcast_mode = {node_params.REBROADCAST_MODE}")
-    step("device role", mesh + ["--set", "device.role", device_role])
 
     # Bluetooth config: off — the nRF52840 proxy serves the BLE side.
     ble = str(node_params.BLUETOOTH_ENABLE).lower()

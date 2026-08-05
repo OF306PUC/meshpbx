@@ -534,7 +534,7 @@ int ble_gatt_enqueue_fromradio(struct bt_conn *conn, const uint8_t *data, uint16
         LOG_WRN("FROMNUM notify failed: %d", err);
     } else {
         LOG_INF("FROMNUM notification to=+56%" PRIu32 " fromnum=%" PRIu32,
-                sys_get_le32(pc->proxy_id.bytes), fromnum_val);
+                sys_get_be32(pc->proxy_id.bytes), fromnum_val);
     }
 
     return 0;
@@ -560,7 +560,7 @@ int ble_gatt_register_proxy_id(struct bt_conn *conn, const proxy_id_t *id)
         return -ENOENT;
     }
     memcpy(&pc->proxy_id, id, sizeof(proxy_id_t));
-    uint32_t phone_num_reg = sys_get_le32(id->bytes); 
+    uint32_t phone_num_reg = sys_get_be32(id->bytes); 
     LOG_INF("proxy_id [CL phone]: +56%" PRIu32 ". Register for slot %ld",
             phone_num_reg, (long)(pc - conns));
     return 0;

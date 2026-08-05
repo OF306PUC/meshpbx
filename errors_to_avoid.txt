@@ -1,0 +1,6 @@
+ERROR | 20:38:44 1448 [RadioIf] Ignore received packet due to error=-7 (maybe id=0x94c7139f fr=0xbb8106c4 to=0x5fffffff flags=0x21 rxSNR=6.75 rxRSSI=-35 nextHop=0x0 relay=0xc4)
+==> Due: 
+Yes, this error means a packet was detected, but the CRC did not match, hence there was an error while decoding the packet. Your airtime is very long: Packet RX (noise?) : 3870ms, and yes, then this may happen more frequently especially if there is interference.
+
+
+WARN  | 20:40:18 1545 [Serial] Rate limit portnum 67
