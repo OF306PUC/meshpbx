@@ -58,7 +58,7 @@ void router_dispatch(const uint8_t *raw_bytes, uint16_t len,
     }
 
     /* ------------------------ Broadcast Path ------------------------ */
-    
+
     /* ----------------------------------------------------------------
      * Tier 1: non-packet FromRadio variant → broadcast unconditionally,
      * EXCEPT the queueStatus the node sends in reply to our own upstream
@@ -71,9 +71,12 @@ void router_dispatch(const uint8_t *raw_bytes, uint16_t len,
             LOG_DBG("keepalive queueStatus swallowed (not broadcast)");
             return;
         }
+        /* Placed here so we do not use keepalive queueStatus to reset the timer */
+        upstream_liveness_kick(); 
         ble_gatt_broadcast_fromradio(raw_bytes, len);
         return;
     }
+    upstream_liveness_kick(); 
 
     /* ----------------------------------------------------------------
      * Packet variant — check if it's decoded (plaintext) or encrypted.

@@ -118,4 +118,7 @@ bool upstream_swallow_live_queuestatus(void);
  */
 void upstream_refetch(void);
 
+
+void upstream_liveness_kick(void);
+
 #endif /* UPSTREAM_SESSION_H */
