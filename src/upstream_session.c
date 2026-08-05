@@ -75,8 +75,10 @@ static void (*s_serve_cb)(struct bt_conn *conn, uint32_t nonce);
  * ToRadio TX, so it only fires after a stretch of true silence.
  * ------------------------------------------------------------------------- */
 #define UPSTREAM_KEEPALIVE_MS (5 * 60 * 1000)   /* 5 min < 15-min serial timeout */
+#define UPSTREAM_FETCH_RETRY_MS 2000            /* no-progress watchdog; NOT a burst deadline */
 
 static struct k_work_delayable s_keepalive_work;
+static struct k_work_delayable s_fetch_retry_work;
 static bool                    s_keepalive_armed;       /* work inited + scheduled */
 static uint32_t                s_keepalive_nonce = 2;   /* never 0 or 1          */
 static bool                    s_keepalive_pending;     /* awaiting our qStatus  */
@@ -305,11 +307,36 @@ static int send_want_config(uint32_t nonce){
     return 0;
 }
 
+static void fetch_retry_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    enum upstream_state st = s_state;
+    if (st != UPSTREAM_FETCHING && st != UPSTREAM_REFETCHING) {
+        return;
+    } else if (st == UPSTREAM_FETCHING) {
+        cache_begin();
+        phase0_reset();
+    }
+
+    send_want_config(s_nonce);
+    LOG_WRN("fetch stalled — resending want_config nonce=%u (state=%d)", s_nonce, st);
+    k_work_reschedule(&s_fetch_retry_work, K_MSEC(UPSTREAM_FETCH_RETRY_MS));
+}
+
 /* -------------------------------------------------------------------------
  * Public API.
  * ------------------------------------------------------------------------- */
 void upstream_session_start(void)
 {
+    /* Arm the UART keepalive. It fires after UPSTREAM_KEEPALIVE_MS of
+     * silence; every real ToRadio TX pushes it out via
+     * upstream_keepalive_reschedule(). */
+    k_work_init_delayable(&s_keepalive_work, keepalive_work_handler);
+    k_work_init_delayable(&s_fetch_retry_work, fetch_retry_handler);
+    s_keepalive_armed = true;
+    k_work_reschedule(&s_keepalive_work, K_MSEC(UPSTREAM_KEEPALIVE_MS));
+
     /* Pick a nonce that is neither 0 nor 1. nonce 1 is special on the node:
      * it forces a NodeInfo rebroadcast, so it must never be a plain config
      * nonce. Bump 0/1 to 2. */
@@ -337,21 +364,16 @@ void upstream_session_start(void)
 
     int rc = uart_meshtastic_tx(buf, (uint16_t)stream.bytes_written);
     if (rc != 0) {
-        LOG_ERR("want_config tx failed: %d", rc);
-        /* Stay in BOOT so a higher layer can retry the start. */
+        LOG_ERR("want_config tx failed: %d. Retrying node boot fetching", rc);
+        s_state = UPSTREAM_FETCHING;
+        k_work_reschedule(&s_fetch_retry_work, K_MSEC(UPSTREAM_FETCH_RETRY_MS));
         return;
     }
 
     s_state = UPSTREAM_FETCHING;
+    k_work_reschedule(&s_fetch_retry_work, K_MSEC(UPSTREAM_FETCH_RETRY_MS));
     LOG_INF("upstream start: want_config nonce=%u sent (%u B), FETCHING",
             (unsigned)s_nonce, (unsigned)stream.bytes_written);
-
-    /* Arm the UART keepalive. It fires after UPSTREAM_KEEPALIVE_MS of
-     * silence; every real ToRadio TX pushes it out via
-     * upstream_keepalive_reschedule(). */
-    k_work_init_delayable(&s_keepalive_work, keepalive_work_handler);
-    s_keepalive_armed = true;
-    k_work_reschedule(&s_keepalive_work, K_MSEC(UPSTREAM_KEEPALIVE_MS));
 }
 
 enum upstream_state upstream_get_state(void)
@@ -377,6 +399,8 @@ bool upstream_on_fromradio(const uint8_t *payload, uint16_t len,
     if (info->which_variant == meshtastic_FromRadio_packet_tag) {
         return false;
     }
+
+    k_work_reschedule(&s_fetch_retry_work, K_MSEC(UPSTREAM_FETCH_RETRY_MS));
 
     /* The closing config_complete_id — finish the burst ONLY if it carries
      * OUR nonce. fromradio_info does not expose config_complete_id, so we
@@ -425,6 +449,7 @@ bool upstream_on_fromradio(const uint8_t *payload, uint16_t len,
             LOG_INF("upstream: config complete (absorbed) nonce=%u → LIVE",
                     (unsigned)got_nonce);
         }
+        k_work_cancel_delayable(&s_fetch_retry_work);
 
         return true;
     }
@@ -529,6 +554,7 @@ void upstream_refetch(void)
     }
 
     s_state = UPSTREAM_REFETCHING;
+    k_work_reschedule(&s_fetch_retry_work, K_MSEC(UPSTREAM_FETCH_RETRY_MS));
     upstream_keepalive_reschedule();
     LOG_INF("upstream refetch: want_config nonce=%u sent, REFETCHING",
             (unsigned)s_nonce);
