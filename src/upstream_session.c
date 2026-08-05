@@ -75,7 +75,8 @@ static void (*s_serve_cb)(struct bt_conn *conn, uint32_t nonce);
  * ToRadio TX, so it only fires after a stretch of true silence.
  * ------------------------------------------------------------------------- */
 #define UPSTREAM_KEEPALIVE_MS           (5 * 60 * 1000)   /* 5 min < 15-min serial timeout */
-#define UPSTREAM_FETCH_RETRY_MS         2000              /* no-progress watchdog; NOT a burst deadline */
+#define UPSTREAM_KEEPALIVE_RETRY_MS     (20 * 1000)       /* 20 secs to retry uart_tx */
+#define UPSTREAM_FETCH_RETRY_MS         (2000)            /* no-progress watchdog; NOT a burst deadline */
 #define UPSTREAM_LIVENESS_TIMEOUT_MS    (30 * 60 * 1000)  /* > longest legit mesh silence; see robustness doc */
 
 static struct k_work_delayable s_keepalive_work;
@@ -84,6 +85,7 @@ static struct k_work_delayable s_liveness_work;
 static bool                    s_keepalive_armed;       /* work inited + scheduled */
 static uint32_t                s_keepalive_nonce = 2;   /* never 0 or 1          */
 static bool                    s_keepalive_pending;     /* awaiting our qStatus  */
+static uint32_t                s_tx_fail_cnt;           /* consecutive keepalive tx failures */
 
 /* -------------------------------------------------------------------------
  * Phase 0 per-variant accumulators (bytes + counts). Reset in cache_begin
@@ -271,18 +273,23 @@ static void keepalive_work_handler(struct k_work *work)
         int err = uart_meshtastic_tx(buf, len);
         if (err != 0) {
             s_keepalive_pending = false;
-            LOG_WRN("keepalive tx failed: %d", err);
+            s_tx_fail_cnt++;
+            k_work_reschedule(&s_keepalive_work, K_MSEC(UPSTREAM_KEEPALIVE_RETRY_MS));
+            LOG_WRN("keepalive tx failed %u times in a row (err %d) — retry in %u ms",
+                    (unsigned)s_tx_fail_cnt, err, UPSTREAM_KEEPALIVE_RETRY_MS);
         } else {
             /* INF (not DBG): fires only every ~5 min, and it is the line you
              * watch to confirm the upstream keepalive is alive on hardware. */
+            s_tx_fail_cnt = 0;   /* consecutive-failure counter: reset on success */
+            k_work_reschedule(&s_keepalive_work, K_MSEC(UPSTREAM_KEEPALIVE_MS));
             LOG_INF("upstream keepalive heartbeat nonce=%u (%u B) → UART",
                     (unsigned)nonce, (unsigned)len);
         }
     } else {
+        k_work_reschedule(&s_keepalive_work, K_MSEC(UPSTREAM_KEEPALIVE_MS));
         LOG_WRN("keepalive encode failed: %d", rc);
     }
 
-    k_work_reschedule(&s_keepalive_work, K_MSEC(UPSTREAM_KEEPALIVE_MS));
 }
 
 /* -------------------------------------------------------------------------
