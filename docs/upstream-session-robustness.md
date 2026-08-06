@@ -99,6 +99,21 @@ valid proof and its **absence** is what we detect. The keepalive reply is alread
 isolated by `upstream_swallow_live_queuestatus()`; the liveness kick is placed
 *after* that early return.
 
+### 3.5 Reboot signal (`FromRadio{rebooted}`)
+
+When the node reboots it emits `FromRadio{rebooted=true}` at serial-API init.
+`router.c` detects that variant in `LIVE` and calls `upstream_refetch()`
+immediately, then **absorbs** it (not broadcast — the proxy masks the reboot from
+phones and refreshes the cache via the refetch). This is the *fast* reboot-recovery
+path: seconds, versus up to N (§4) for the liveness watchdog.
+
+Confirmed viable on this rig: the node runs `SerialModule` in **PROTO** mode
+(`configure_params.py`: `SERIAL_MODULE_MODE=PROTO`, TXD 15 / RXD 35). That matters
+because `StreamAPI::canWrite` is true at init there and `SerialModule` calls
+`emitRebooted()` → the frame reaches the wire. The `canWrite`-gated dead-`emitRebooted`
+defect (D1 in `tophone-queue-stall.md`) is **`SerialConsole`-specific and does not
+apply** to this transport.
+
 ## 4. The N decision (`UPSTREAM_LIVENESS_TIMEOUT_MS`)
 
 N is the single tuning knob of the liveness watchdog and it is a
@@ -115,9 +130,9 @@ N is the single tuning knob of the liveness watchdog and it is a
 - **Default: 30 min**, chosen against a telemetry cadence on the order of minutes.
   Re-tune from the real deployment: read the node's telemetry/nodeinfo period and
   keep N comfortably above the longest expected quiet stretch.
-- **Relaxation lever** — once the `rebooted` signal is handled (reboot detected in
-  seconds), the liveness watchdog becomes a *backstop* for the rare unsignalled
-  cases (timeout, frame desync), and N can be raised further.
+- **Relaxation lever** — with the `rebooted` signal now handled (§3.5, reboot
+  detected in seconds), the liveness watchdog is a *backstop* for the rare
+  unsignalled cases (timeout, frame desync), so N can be raised further.
 
 **No phones-connected gate.** The watchdog runs in `LIVE` regardless of whether
 any phone is connected. Gating on connection count would force an `upstream_session`
@@ -131,19 +146,21 @@ invisible to any connected phone (served from cache; live packets still broadcas
 | Constant | Value | Purpose | Reset / fires |
 |---|---|---|---|
 | `UPSTREAM_KEEPALIVE_MS` | 5 min | keep the node's 15-min serial timer alive | rescheduled on every real ToRadio TX |
+| `UPSTREAM_KEEPALIVE_RETRY_MS` | 20 s | retry a dropped keepalive early (TX-queue-full) so repeated drops cannot span the 15-min timeout | on keepalive tx failure |
 | `UPSTREAM_FETCH_RETRY_MS` | 2 s | resend `want_config` if a fetch stalls | reset on burst progress; fires on fetch silence |
 | `UPSTREAM_LIVENESS_TIMEOUT_MS` | 30 min | detect a dead session during `LIVE` | reset on genuine FromRadio; fires on session silence |
 
-All three run on the single Zephyr system work queue (single-writer, no mutexes).
+All run on the single Zephyr system work queue (single-writer, no mutexes).
 The keepalive and its `queueStatus` reply are **not** a liveness signal (§3.4).
 
-## 6. Not yet implemented
+RX-side hardening lives in `uart_meshtastic.c` (overrun accounting, a larger RX
+ring, and a 250 ms mid-frame resync watchdog) — see `tophone-queue-stall.md` §D3;
+it protects the frame stream that feeds everything above.
 
-- **`FromRadio{rebooted}` handler** → fast reboot recovery via `upstream_refetch()`.
-  Viable only if the node's transport is `SerialModule` in PROTO mode (where
-  `canWrite` is true at init and `emitRebooted()` reaches the wire); needs the
-  T-Beam wiring confirmed.
-- **Keepalive no-silent-loss** — retry a dropped keepalive early instead of waiting
-  the full 5-min interval, so repeated TX-queue-full cannot open a 15-min gap.
-- **UART RX robustness** — check `ring_buf_put` return, add an inter-frame resync
-  timeout to the RX state machine, drain in bulk. See `tophone-queue-stall.md` §D3.
+## 6. Not yet implemented / deferred
+
+- **Per-phone slot teardown on `ToRadio{disconnect}`** — a phone that ends its API
+  session without dropping the BLE link leaks its proxy slot. Parked pending the
+  app-developer contract question in [`disconnect-flow.md`](./disconnect-flow.md).
+- **Bulk RX drain** — the RX ring is still drained one byte per `ring_buf_get`.
+  Purely a performance/starvation improvement, not a correctness gap.

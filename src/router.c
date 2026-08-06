@@ -66,17 +66,25 @@ void router_dispatch(const uint8_t *raw_bytes, uint16_t len,
      * phones, so swallow it instead of broadcasting noise.
      * ---------------------------------------------------------------- */
     if (info->which_variant != meshtastic_FromRadio_packet_tag) {
+        /* Node reboot: reopen the session immediately (fast path vs the
+         * liveness watchdog). Absorbed — NOT broadcast; the proxy masks the
+         * reboot from phones and refreshes the cache via the refetch. */
+        if (info->which_variant == meshtastic_FromRadio_rebooted_tag) {
+            LOG_WRN("node rebooted — triggering upstream refetch");
+            upstream_refetch();
+            return;
+        }
         if (info->which_variant == meshtastic_FromRadio_queueStatus_tag &&
             upstream_swallow_live_queuestatus()) {
             LOG_DBG("keepalive queueStatus swallowed (not broadcast)");
             return;
         }
         /* Placed here so we do not use keepalive queueStatus to reset the timer */
-        upstream_liveness_kick(); 
+        upstream_liveness_kick();
         ble_gatt_broadcast_fromradio(raw_bytes, len);
         return;
     }
-    upstream_liveness_kick(); 
+    upstream_liveness_kick();
 
     /* ----------------------------------------------------------------
      * Packet variant — check if it's decoded (plaintext) or encrypted.
