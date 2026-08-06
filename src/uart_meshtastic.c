@@ -33,9 +33,10 @@ LOG_MODULE_REGISTER(uart_meshtastic, LOG_LEVEL_DBG);
 #define MESHTASTIC_MAGIC2    0xC3U
 
 #define UART_DMA_BUF_SIZE    256U   /* DMA double-buffer size per buffer        */
-#define RING_BUF_SIZE        1024U  /* RX ring buffer (power of 2)              */
+#define RING_BUF_SIZE        2048U  /* RX ring buffer (power of 2)              */
 #define UART_RX_TIMEOUT_US   2000U  /* Inter-byte timeout before UART_RX_RDY    */
 #define TX_QUEUE_DEPTH       4U     /* Max queued outbound ToRadio packets      */
+#define RX_RESYNC_TIMEOUT_MS 250U   /* > max frame time (512 bytes --> ~45ms); reset a stalled partial frame */
 
 /*
  * TX timeout: guards against a stuck UART hardware (not receiver backpressure —
@@ -83,6 +84,7 @@ RING_BUF_DECLARE(rx_ring_buf, RING_BUF_SIZE);
 
 static const struct device  *uart_dev;
 static fromradio_uart_cb_t   fromradio_cb;
+static atomic_t              rx_overrun_bytes;  /* bytes dropped by a full RX ring */
 
 /* ------------------------------------------------------------- Activity LEDs */
 
@@ -181,6 +183,22 @@ static void rx_process_byte(uint8_t byte)
     }
 }
 
+/* Reset a stalled partial frame. Runs on the system work queue (same context as
+ * rx_work_handler), so it touches rx_sm without a mutex. */
+static void rx_resync_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    if (rx_sm.state != RX_WAIT_MAGIC1) {
+        LOG_WRN("RX frame stalled mid-frame (state=%u, %u/%u B) — resyncing",
+                rx_sm.state, rx_sm.received_len, rx_sm.expected_len);
+        rx_sm.state        = RX_WAIT_MAGIC1;
+        rx_sm.received_len = 0;
+        rx_sm.expected_len = 0;
+    }
+}
+
+static K_WORK_DELAYABLE_DEFINE(rx_resync_dwork, rx_resync_handler);
+
 static void rx_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
@@ -188,10 +206,22 @@ static void rx_work_handler(struct k_work *work)
     while (ring_buf_get(&rx_ring_buf, &byte, 1) == 1) {
         rx_process_byte(byte);
     }
+
+    /* No-progress watchdog: reschedule (push the deadline) while mid-frame,
+     * cancel at a frame boundary. Fires only after a true mid-frame stall. */
+    if (rx_sm.state != RX_WAIT_MAGIC1) {
+        k_work_reschedule(&rx_resync_dwork, K_MSEC(RX_RESYNC_TIMEOUT_MS));
+    } else {
+        k_work_cancel_delayable(&rx_resync_dwork);
+    }
+
+    atomic_val_t dropped = atomic_set(&rx_overrun_bytes, 0);
+    if (dropped > 0) {
+        LOG_WRN("RX overrun: %u byte(s) dropped (ring full)", (unsigned)dropped);
+    }
 }
 
 static K_WORK_DEFINE(rx_work, rx_work_handler);
-
 /* ------------------------------------------------------ TX work handler
  *
  * Dequeues one entry from tx_msgq and starts a uart_tx().
@@ -245,9 +275,12 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
          * counting enabled) the RX line went idle for UART_RX_TIMEOUT_US and the
          * driver flushed a partial buffer. The latter is what delivers a lone
          * FromRadio frame promptly instead of stalling until the buffer fills. */
-        ring_buf_put(&rx_ring_buf,
-                     evt->data.rx.buf + evt->data.rx.offset,
-                     evt->data.rx.len);
+        uint32_t put = ring_buf_put(&rx_ring_buf,
+                                    evt->data.rx.buf + evt->data.rx.offset,
+                                    evt->data.rx.len);
+        if (put < evt->data.rx.len) {
+            atomic_add(&rx_overrun_bytes, (atomic_val_t)(evt->data.rx.len - put));
+        }
         atomic_set(&uart_rx_active, 1);
         k_work_submit(&rx_work);
         break;
@@ -276,6 +309,7 @@ static void uart_cb(const struct device *dev, struct uart_event *evt, void *user
         if (rerr) {
             LOG_ERR("UART RX re-enable failed: %d", rerr);
         }
+        rx_sm.state = RX_WAIT_MAGIC1;
         break;
     }
 
