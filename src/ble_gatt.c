@@ -111,6 +111,17 @@ static K_WORK_DELAYABLE_DEFINE(led_blink_dwork, led_blink_work);
 #define FROMNUM_ATTR_IDX  2
 #define LOGRADIO_ATTR_IDX 9
 
+/*
+ * Grace period between absorbing ToRadio{disconnect} and dropping the BLE link.
+ *
+ * TORADIO accepts write-WITH-response, and that response is only emitted once
+ * toradio_write() returns, then goes out on the next connection event.
+ * CONFIG_BT_PERIPHERAL_PREF_MAX_INT=100 is in 1.25 ms units, so the negotiated
+ * interval can be as long as 125 ms — 250 ms clears two worst-case events.
+ * Do not lower this below ~150 ms without also lowering PREF_MAX_INT.
+ */
+#define TEARDOWN_DELAY_MS 250
+
 /* --------------------------------------------------------- Per-conn state */
 
 struct pkt_entry {
@@ -125,6 +136,7 @@ struct proxy_conn {
 
     /* Per-phone config-session state */
     enum phone_state state;          /* CONNECTED → … → ACTIVE                       */
+    bool             leaving;        /* Leaving flag to force slot teardown on ToRadio{disconnect} */
     uint32_t         nonce;          /* This phone's want_config nonce               */
     uint16_t         replay_cursor;  /* Next cache frame index to replay             */
     uint8_t          cc_frame[16];   /* Pre-encoded config_complete_id (served last) */
@@ -141,6 +153,9 @@ struct proxy_conn {
     uint16_t         staged_len;
 
     struct k_mutex   lock;
+
+    /* Teardown slot for ToRadio{disconnect} messages */
+    struct k_work_delayable teardown_work; 
 };
 
 static struct proxy_conn conns[MAX_BLE_CONNECTIONS];
@@ -171,6 +186,7 @@ static struct proxy_conn *alloc_slot(struct bt_conn *conn)
             conns[i].count         = 0;
             conns[i].staged_len    = 0;
             conns[i].state         = PHONE_CONNECTED;
+            conns[i].leaving       = false;  /* MUST reset: slots are recycled by index */
             conns[i].nonce         = 0;
             conns[i].replay_cursor = 0;
             return &conns[i];
@@ -179,8 +195,27 @@ static struct proxy_conn *alloc_slot(struct bt_conn *conn)
     return NULL;
 }
 
+/*
+ * Release a slot and reset it for reuse. Called from on_disconnected() on the
+ * BT RX thread.
+ *
+ * The reset runs under pc->lock because ble_gatt_enqueue_fromradio() does
+ * find_slot() and only *then* locks: without the lock here, this thread can
+ * reset and reassign the slot in that gap while the writer proceeds to memcpy
+ * into it.
+ */
 static void free_slot(struct proxy_conn *pc)
 {
+    /*
+     * Cancel first: a still-armed teardown would otherwise fire against a slot
+     * that has already been recycled. Non-blocking on purpose — the _sync
+     * variant would park the BT RX thread on a handler that wants pc->lock,
+     * which deadlocks outright if this reset ever moves inside the lock.
+     * A handler already running is handled by its own !leaving check.
+     */
+    k_work_cancel_delayable(&pc->teardown_work);
+
+    k_mutex_lock(&pc->lock, K_FOREVER);
     if (pc->conn) {
         bt_conn_unref(pc->conn);
         pc->conn = NULL;
@@ -192,8 +227,10 @@ static void free_slot(struct proxy_conn *pc)
     pc->count         = 0;
     pc->staged_len    = 0;
     pc->state         = PHONE_CONNECTED;
+    pc->leaving       = false;   /* MUST reset: a stale flag would black-hole the next phone */
     pc->nonce         = 0;
     pc->replay_cursor = 0;
+    k_mutex_unlock(&pc->lock);
 }
 
 /* --------------------------------------------------------- GATT callbacks */
@@ -355,6 +392,68 @@ static ssize_t node_reg_write(struct bt_conn *conn, const struct bt_gatt_attr *a
     return len;
 }
 
+/*
+ * Deferred teardown for a phone that sent ToRadio{disconnect}.
+ *
+ * Runs on the system workqueue — NOT the BT RX thread that armed it. That
+ * thread switch is the whole point: it keeps bt_conn_disconnect() out of the
+ * TORADIO write path so the ATT write response can still go out (see
+ * ble_gatt_request_teardown()). It also means every field of *pc is shared
+ * with the BT RX thread, hence the locking below.
+ *
+ * This handler does NOT free the slot. It only triggers the link teardown; the
+ * existing on_disconnected() → free_slot() path does the cleanup. One cleanup
+ * route, already exercised by the normal disconnect flow.
+ */
+static void teardown_work_handler(struct k_work *work)
+{
+    /*
+     * Zephyr's work handler signature carries no user data, so the slot is
+     * recovered geometrically: teardown_work is a field inside proxy_conn, so
+     * subtracting the field's offset from its address yields the containing
+     * slot. That is what CONTAINER_OF() does.
+     */
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct proxy_conn *pc = CONTAINER_OF(dwork, struct proxy_conn, teardown_work);
+
+    /*
+     * Copy the conn out under the lock and take our OWN reference: free_slot()
+     * can run on the BT RX thread at any instant and drop the slot's
+     * reference, freeing the bt_conn under us mid-call.
+     *
+     * The !leaving check closes a narrow recycle window: if this handler was
+     * already dequeued when free_slot() ran, the cancel there is a no-op, and
+     * a new phone could have been allocated into the same slot before we take
+     * the lock. Both alloc_slot() and free_slot() clear `leaving`, so a
+     * recycled slot fails this test and we never disconnect the newcomer.
+     */
+    k_mutex_lock(&pc->lock, K_FOREVER);
+    struct bt_conn *conn = (pc->conn && pc->leaving) ? bt_conn_ref(pc->conn) : NULL;
+    k_mutex_unlock(&pc->lock);
+
+    if (!conn) {
+        /* on_disconnected() won the race, or the slot was recycled. */
+        LOG_DBG("teardown: slot %ld already released — nothing to do",
+                (long)(pc - conns));
+        return;
+    }
+
+    /* Called outside the lock: this enters the BT stack and can invoke callbacks. */
+    int err = bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+    if (err == -ENOTCONN) {
+        /* Expected and common: the app's own disconnect got there first. */
+        LOG_DBG("teardown: conn %p already disconnected", (void *)conn);
+    } else if (err) {
+        LOG_WRN("teardown: bt_conn_disconnect failed for slot %ld: %d",
+                (long)(pc - conns), err);
+    } else {
+        LOG_INF("teardown: slot %ld link dropped (phone sent disconnect)",
+                (long)(pc - conns));
+    }
+
+    bt_conn_unref(conn);
+}
+
 /* ------------------------------------------------------- GATT service def */
 
 BT_GATT_SERVICE_DEFINE(meshtastic_svc,
@@ -493,8 +592,40 @@ int ble_gatt_init(toradio_cb_t cb)
     toradio_handler = cb;
     for (int i = 0; i < MAX_BLE_CONNECTIONS; i++) {
         k_mutex_init(&conns[i].lock);
+        k_work_init_delayable(&conns[i].teardown_work, teardown_work_handler); 
     }
     return 0;
+}
+
+/*
+ * Ring the FROMNUM doorbell.
+ *
+ * FROMNUM is a signal, not a data channel: the phone's contract is "on
+ * notification, read FROMRADIO until the response comes back empty". So this is
+ * called on BOTH the success path and the queue-full path. A full queue is
+ * precisely the moment the phone most needs to be told to read, and staying
+ * silent there is what makes a stall self-sustaining: full → no doorbell → no
+ * read → still full, with nothing left in the system to ring again.
+ *
+ * @param conn         Connection to notify.
+ * @param fromnum_val  Counter to send. NOT incremented for a dropped packet —
+ *                     it counts packets actually queued, and BLE notifications
+ *                     are not deduplicated, so an unchanged value still
+ *                     triggers the drain.
+ * @param phone_num    Registered proxy_id, for the log line only.
+ *
+ * Zephyr checks the CCC internally and drops the notify if unsubscribed.
+ */
+static void notify_fromnum(struct bt_conn *conn, uint32_t fromnum_val, uint32_t phone_num)
+{
+    int err = bt_gatt_notify(conn, &meshtastic_svc.attrs[FROMNUM_ATTR_IDX],
+                             &fromnum_val, sizeof(fromnum_val));
+    if (err) {
+        LOG_WRN("FROMNUM notify failed: %d", err);
+    } else {
+        LOG_INF("FROMNUM notification to=+56%" PRIu32 " fromnum=%" PRIu32,
+                phone_num, fromnum_val);
+    }
 }
 
 int ble_gatt_enqueue_fromradio(struct bt_conn *conn, const uint8_t *data, uint16_t len)
@@ -510,9 +641,29 @@ int ble_gatt_enqueue_fromradio(struct bt_conn *conn, const uint8_t *data, uint16
 
     k_mutex_lock(&pc->lock, K_FOREVER);
 
-    if (pc->count >= FROMRADIO_QUEUE_DEPTH) {
+    /*
+     * Slot is being torn down (phone sent ToRadio{disconnect}). Drop quietly and
+     * return a distinct errno: -ESHUTDOWN is an expected departure, -ENOMEM is a
+     * live phone that has stopped draining. Collapsing them into one code would
+     * lose exactly the distinction this fix exists to make.
+     */
+    if (pc->leaving) {
         k_mutex_unlock(&pc->lock);
-        LOG_WRN("FromRadio queue full for conn %p", (void *)conn);
+        LOG_DBG("FromRadio drop: slot %ld is leaving", (long)(pc - conns));
+        return -ESHUTDOWN;
+    }
+
+    uint32_t phone_num = sys_get_be32(pc->proxy_id.bytes);
+
+    if (pc->count >= FROMRADIO_QUEUE_DEPTH) {
+        /* Unchanged: nothing was queued, so the counter must not advance. */
+        uint32_t fromnum_val = pc->fromnum;
+        k_mutex_unlock(&pc->lock);
+
+        LOG_WRN("FromRadio queue full for conn %p (%d deep) — packet dropped, re-ringing FROMNUM",
+                (void *)conn, FROMRADIO_QUEUE_DEPTH);
+
+        notify_fromnum(conn, fromnum_val, phone_num);
         return -ENOMEM;
     }
 
@@ -526,17 +677,7 @@ int ble_gatt_enqueue_fromradio(struct bt_conn *conn, const uint8_t *data, uint16
     uint32_t fromnum_val = pc->fromnum;
     k_mutex_unlock(&pc->lock);
 
-    /* Notify the routed contact (phone). Zephyr checks CCC internally and drops if not subscribed. */
-    int err = bt_gatt_notify(conn, &meshtastic_svc.attrs[FROMNUM_ATTR_IDX],
-                             &fromnum_val, sizeof(fromnum_val));
-    
-    if (err) {
-        LOG_WRN("FROMNUM notify failed: %d", err);
-    } else {
-        LOG_INF("FROMNUM notification to=+56%" PRIu32 " fromnum=%" PRIu32,
-                sys_get_be32(pc->proxy_id.bytes), fromnum_val);
-    }
-
+    notify_fromnum(conn, fromnum_val, phone_num);
     return 0;
 }
 
@@ -572,7 +713,10 @@ int ble_gatt_broadcast_fromradio(const uint8_t *data, uint16_t len)
     for (int i = 0; i < MAX_BLE_CONNECTIONS; i++) {
         if (conns[i].conn) {
             int err = ble_gatt_enqueue_fromradio(conns[i].conn, data, len);
-            if (err) {
+            if (err == -ESHUTDOWN) {
+                /* Expected: slot is mid-teardown. Not a warning. */
+                LOG_DBG("broadcast: slot %d skipped (leaving)", i);
+            } else if (err) {
                 LOG_WRN("broadcast: slot %d enqueue failed: %d", i, err);
             } else {
                 sent++;
@@ -673,10 +817,38 @@ void ble_gatt_reply_queuestatus(struct bt_conn *conn)
     }
 
     int err = ble_gatt_enqueue_fromradio(conn, s_qs, s_qs_len);
-    if (err) {
+    if (err == -ESHUTDOWN) {
+        /* A phone can send heartbeat in the window between its disconnect and
+         * the teardown firing. Expected, not a warning. */
+        LOG_DBG("queueStatus reply skipped: conn %p is leaving", (void *)conn);
+    } else if (err) {
         LOG_WRN("queueStatus reply enqueue failed: %d (conn %p)", err, (void *)conn);
     } else {
         LOG_DBG("heartbeat → synth queueStatus (%u B) → conn %p",
                 (unsigned)s_qs_len, (void *)conn);
     }
+}
+
+
+int ble_gatt_request_teardown(struct bt_conn *conn)
+{
+    struct proxy_conn *pc = find_slot(conn);
+    if (!pc) {
+        return -ENOENT;
+    }
+
+    /* Mark the slot immediately so no further FromRadio frames are queued for a
+     * phone that will never drain them — this is what stops the leak even if
+     * the disconnect below fails. */
+    k_mutex_lock(&pc->lock, K_FOREVER);
+    pc->leaving = true;
+    k_mutex_unlock(&pc->lock);
+
+    /* reschedule(), not schedule(): a phone that sends disconnect twice should
+     * push the deadline out, not have the second request silently dropped. */
+    k_work_reschedule(&pc->teardown_work, K_MSEC(TEARDOWN_DELAY_MS));
+
+    LOG_INF("teardown scheduled for slot %ld in %d ms (phone sent disconnect)",
+            (long)(pc - conns), TEARDOWN_DELAY_MS);
+    return 0;
 }

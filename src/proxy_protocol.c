@@ -8,6 +8,15 @@
 #include <string.h>
 #include <stdio.h>
 
+
+uint32_t proxy_id_value(const uint8_t *bytes)
+{
+    return (uint32_t)bytes[3]
+        | ((uint32_t)bytes[2] <<  8)
+        | ((uint32_t)bytes[1] << 16)
+        | ((uint32_t)bytes[0] << 24); 
+}
+
 bool proxy_header_parse(const uint8_t *payload, uint16_t len,
                         struct proxy_header *out)
 {
@@ -91,12 +100,7 @@ const char *proxy_id_to_str(const proxy_id_t *id, char *out, size_t out_size)
         return out;
     }
 
-    const uint8_t *b = id->bytes;
-    /* Canonical UUID grouping (8-4-4-4-12) over the raw big-endian bytes. */
-    snprintf(out, out_size,
-             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-             b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    snprintf(out, out_size, "%u", (unsigned)proxy_id_value(id->bytes)); 
     return out;
 }
 
@@ -111,8 +115,8 @@ const char *proxy_header_to_str(const struct proxy_header *hdr,
         return out;
     }
 
-    char src[PROXY_ID_STR_SIZE];
-    char dst[PROXY_ID_STR_SIZE];
+    char src[PROXY_ID_SIZE];
+    char dst[PROXY_ID_SIZE];
     proxy_id_to_str(&hdr->src, src, sizeof(src));
     proxy_id_to_str(&hdr->dst, dst, sizeof(dst));
 

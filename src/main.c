@@ -96,9 +96,18 @@ static void on_toradio_ble(struct bt_conn *conn, const uint8_t *data, uint16_t l
     }
 
     if (ti.has_disconnect) {
-        /* Absorbed locally: never forward through UART to keep an active PhoneAPI session.
-         * This keeps the drain of toPhoneQueue*/
+        /* Two independent actions, both required:
+         *
+         * 1. Absorb toward the node: never forward through UART. The node's
+         *    PhoneAPI session is shared by every phone, and disconnect would put
+         *    it in STATE_SEND_NOTHING, stalling toPhoneQueue for everyone.
+         *
+         * 2. Release toward the phone: tear down this phone's slot. Without
+         *    this, a phone that ends its API session but leaves the BLE link up
+         *    leaks its slot and its FromRadio queue overflows on every frame
+         *    forever. See ble_gatt_request_teardown(). */
         LOG_INF("ToRadio disconnect from conn %p — absorbed (not forwarded)", (void *)conn);
+        ble_gatt_request_teardown(conn);
         return;
     }
 

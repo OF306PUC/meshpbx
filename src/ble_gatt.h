@@ -11,7 +11,7 @@
 #define MAX_BLE_CONNECTIONS     CONFIG_BT_MAX_CONN
 
 /* Per-connection FromRadio packet queue depth */
-#define FROMRADIO_QUEUE_DEPTH   8
+#define FROMRADIO_QUEUE_DEPTH   16
 
 /* Max size of a single FromRadio protobuf packet (bytes) */
 #define FROMRADIO_MAX_PKT_SIZE  512
@@ -110,7 +110,7 @@ void ble_gatt_replay_cached_burst(struct bt_conn *conn, uint32_t nonce);
 void ble_gatt_park_pending(struct bt_conn *conn, uint32_t nonce);
 
 /*
- * Task D — reactive BLE liveness reply. Enqueue a synthesized FromRadio{
+ * Reactive BLE liveness reply. Enqueue a synthesized FromRadio{
  * queueStatus} to this connection (bumps fromnum + notifies FROMNUM) in
  * response to the phone's ToRadio.heartbeat. The phone reads it as "radio
  * data", keeping its app-layer liveness timer from tripping. Absorbed locally
@@ -118,5 +118,32 @@ void ble_gatt_park_pending(struct bt_conn *conn, uint32_t nonce);
  * and reused.
  */
 void ble_gatt_reply_queuestatus(struct bt_conn *conn);
+
+/*
+ * Release this phone's slot after it sent ToRadio{disconnect}.
+ *
+ * Marks the slot as leaving (further FromRadio frames are refused with
+ * -ESHUTDOWN) and schedules the BLE link teardown ~250 ms later, which triggers
+ * the normal on_disconnected() → free_slot() cleanup.
+ *
+ * Why the proxy forces this rather than waiting for the phone: the app intends
+ * to drop the link itself, but cannot guarantee it. FlutterBluePlus queues its
+ * disconnect behind other operations for the device, skips the wait when the
+ * platform reports no state change, and is subject to the documented Android
+ * "stranded connection" race (no gatt handle → the link can never be closed
+ * from the app side). Link supervision does not rescue this either: the
+ * observed leak survived 3+ minutes against a 4 s configured timeout, because
+ * the connection stayed alive at the link layer while being dead at the app
+ * layer. The ToRadio{disconnect} write is the one signal that reliably arrives,
+ * so it is treated as authoritative.
+ *
+ * Safe when the app's own disconnect wins the race — bt_conn_disconnect() then
+ * returns -ENOTCONN and the teardown is a no-op.
+ *
+ * @return  0        teardown scheduled
+ *         -ENOENT   connection not tracked
+ */
+int ble_gatt_request_teardown(struct bt_conn *conn);
+
 
 #endif /* BLE_GATT_H */
